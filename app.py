@@ -9,11 +9,11 @@ st.set_page_config(page_title="Donor Classifier Pro", page_icon="💸", layout="
 
 st.title("💸 Donor Classifier & Analytics")
 st.markdown("""
-Цей інструмент категоризує донорів на **Aliens** (нові) та **Regulars** (повторні), 
-враховуючи історію з бази та "пастку агрегації".
+Цей інструмент категоризує донорів на **New** (нові) та **Repeated** (повторні), 
+враховуючи історію з бази та перевірку на дублі транзакцій у поточному файлі.
 """)
 
-# --- ЛОГІКА (Твій скрипт) ---
+# --- ЛОГІКА ---
 
 def get_token_sort_ratio(str1, str2):
     if not isinstance(str1, str) or not isinstance(str2, str):
@@ -29,7 +29,7 @@ def parse_dates(series):
     return pd.to_datetime(series, format='mixed', errors='coerce')
 
 def process_data(donations_file, supporters_file):
-    # 1. Читання файлів з пам'яті (Streamlit upload)
+    # 1. Читання
     try:
         df_don = pd.read_csv(donations_file)
         df_sup = pd.read_csv(supporters_file)
@@ -41,7 +41,6 @@ def process_data(donations_file, supporters_file):
     df_don['dt_obj'] = parse_dates(df_don['Donation Date'])
     df_sup['first_dt_obj'] = parse_dates(df_sup['First Donation Date'])
     
-    # Визначаємо старт батчу
     BATCH_START_DATE = df_don['dt_obj'].min()
     
     # Клінінг
@@ -52,13 +51,11 @@ def process_data(donations_file, supporters_file):
     df_don['clean_name'] = (df_don['Supporter First Name'].fillna('') + ' ' + df_don['Supporter Last Name'].fillna('')).str.lower().str.strip()
     df_don['Donation Amount'] = pd.to_numeric(df_don['Converted Donation Amount'], errors='coerce').fillna(0)
     
-    # UTM tags
     if 'UTM Campaign Source' in df_don.columns:
         df_don['tag'] = df_don['UTM Campaign Source'].fillna('')
     else:
         df_don['tag'] = ''
 
-    # Dictionary lookup
     sup_dict = df_sup.set_index('Email')[['Lifetime Donations', 'Lifetime Donated', 'first_dt_obj']].to_dict('index')
     
     result = df_don.copy()
@@ -67,14 +64,12 @@ def process_data(donations_file, supporters_file):
     result['hist_count'] = 0
     result['hist_sum'] = 0.0
 
-    # Прогрес-бар для краси
     progress_bar = st.progress(0)
     status_text = st.empty()
     total_rows = len(result)
 
     # 3. Аналіз
     for idx, row in result.iterrows():
-        # Оновлюємо прогрес кожні 10%
         if idx % (max(1, total_rows // 10)) == 0:
             progress = int((idx / total_rows) * 100)
             progress_bar.progress(progress)
@@ -132,14 +127,14 @@ def process_data(donations_file, supporters_file):
     progress_bar.progress(100)
     status_text.text("Готово!")
 
-    # 4. Категоризація
+    # 4. Категоризація (НОВІ НАЗВИ)
     def assign_category(row):
         is_new = row['is_new']
         amount = row['Donation Amount']
         if is_new:
-            return "1. Alien (<500)" if amount < 500 else "2. Alien (500+)"
+            return "1. New (<500)" if amount < 500 else "2. New (500+)"
         else:
-            return "3. Regular (<500)" if amount < 500 else "4. Regular (500+)"
+            return "3. Repeated (<500)" if amount < 500 else "4. Repeated (500+)"
 
     result['category'] = result.apply(assign_category, axis=1)
 
@@ -147,7 +142,7 @@ def process_data(donations_file, supporters_file):
     batch_counts = result['Supporter Email'].value_counts().to_dict()
     result['batch_count'] = result['Supporter Email'].map(batch_counts)
 
-    # 6. Формування Output
+    # 6. Output
     output = pd.DataFrame()
     output['ID'] = result['Supporter ID']
     output['new'] = result['is_new']
@@ -189,13 +184,14 @@ if donations_file and supporters_file:
                 'batch_count': 'first'
             }).reset_index()
 
+            # Категоризація для статистики (НОВІ НАЗВИ)
             def get_unique_category(row):
                 is_new = row['is_new']
                 max_amount = row['Donation Amount']
                 if is_new:
-                    return "1. Alien (<500)" if max_amount < 500 else "2. Alien (500+)"
+                    return "1. New (<500)" if max_amount < 500 else "2. New (500+)"
                 else:
-                    return "3. Regular (<500)" if max_amount < 500 else "4. Regular (500+)"
+                    return "3. Repeated (<500)" if max_amount < 500 else "4. Repeated (500+)"
 
             unique_stats['unique_category'] = unique_stats.apply(get_unique_category, axis=1)
             
@@ -204,10 +200,11 @@ if donations_file and supporters_file:
             multi_donors = len(unique_stats[unique_stats['batch_count'] > 1])
             one_timers = total_people - multi_donors
             
+            # Адекватні назви, як ти просив
             kpi1, kpi2, kpi3 = st.columns(3)
-            kpi1.metric("Всього Людей (Гаманців)", total_people)
-            kpi2.metric("Однолюби (1 донат)", one_timers)
-            kpi3.metric("Фанати (2+ донатів)", multi_donors, delta="Твої герої")
+            kpi1.metric("Унікальних донорів", total_people)
+            kpi2.metric("Донори з 1 донатом", one_timers, help="Люди, які зробили рівно 1 транзакцію у цьому файлі")
+            kpi3.metric("Донори з 2+ донатами", multi_donors, delta="Мульти-донори", help="Люди, які зробили 2 або більше транзакцій у цьому файлі")
 
             st.markdown("### 📊 Розподіл по категоріях (Унікальні люди)")
             cat_counts = unique_stats['unique_category'].value_counts().sort_index()
