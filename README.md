@@ -1,0 +1,1 @@
+# KSE-foundation-donations-categorizer
