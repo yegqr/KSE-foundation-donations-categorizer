@@ -200,11 +200,26 @@ if donations_file and supporters_file:
             multi_donors = len(unique_stats[unique_stats['batch_count'] > 1])
             one_timers = total_people - multi_donors
             
-            # Адекватні назви, як ти просив
+            # --- ВИПРАВЛЕНІ KPI ---
             kpi1, kpi2, kpi3 = st.columns(3)
-            kpi1.metric("Унікальних донорів", total_people)
-            kpi2.metric("Донори з 1 донатом", one_timers, help="Люди, які зробили рівно 1 транзакцію у цьому файлі")
-            kpi3.metric("Донори з 2+ донатами", multi_donors, delta="Мульти-донори", help="Люди, які зробили 2 або більше транзакцій у цьому файлі")
+            
+            kpi1.metric(
+                "Унікальних донорів (у файлі)", 
+                total_people, 
+                help="Кількість унікальних email-адрес у завантаженому файлі donations"
+            )
+            
+            kpi2.metric(
+                "1 донат за цей період", 
+                one_timers, 
+                help="Люди, які зробили рівно 1 транзакцію у цьому файлі"
+            )
+            
+            kpi3.metric(
+                "2+ донатів за цей період", 
+                multi_donors, 
+                help="Люди, які зробили 2 або більше транзакцій САМЕ В ЦЬОМУ файлі (ваші найактивніші зараз)"
+            )
 
             st.markdown("### 📊 Розподіл по категоріях (Унікальні люди)")
             cat_counts = unique_stats['unique_category'].value_counts().sort_index()
