@@ -26,7 +26,7 @@ def is_excluded_from_fuzzy(name, email_body=None):
     """
     # Приводимо до рядка і нижнього регістру для перевірки
     name_str = str(name).lower().strip()
-    stop_words = ['anonymous', 'unknown', 'donor', 'guest', 'user', 'n/a', 'not provided']
+    stop_words = ['anonymous', 'unknown', 'n/a', 'not provided']
     
     # 1. Ім'я занадто загальне або коротке
     if len(name_str) < 3 or any(s in name_str for s in stop_words):
