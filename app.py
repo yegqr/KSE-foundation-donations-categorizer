@@ -2,231 +2,310 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime, time
 import io
+import re
+from thefuzz import fuzz, process
 
 # --- CONFIG ---
-st.set_page_config(page_title="Donor Analytics System 2.0", page_icon="🚀", layout="wide")
-st.title("🚀 Donor Analytics System 2.0")
-st.markdown("Система повного циклу: **Мердж історії** -> **Фільтр по датах** -> **Аналіз**")
+st.set_page_config(page_title="Donor Time Machine", page_icon="🛡️", layout="wide")
+st.title("🛡️ Donor Time Machine: Intelligent Aggregation")
 
-# --- CORE LOGIC ---
+# --- HELPERS ---
 
-def parse_dates(series):
-    return pd.to_datetime(series, format='mixed', errors='coerce')
+def clean_money(val):
+    if pd.isna(val): return 0.0
+    val_str = str(val)
+    clean_str = re.sub(r'[^\d\.]', '', val_str)
+    try:
+        return float(clean_str)
+    except:
+        return 0.0
 
-def normalize_donorbox(df):
-    """Приводить файл Donorbox до стандарту"""
-    # Мапінг колонок на основі твого файлу all-donorb.csv
-    rename_map = {
-        'Donated At': 'date',
-        'Donor Email': 'email',
-        'Donor\'s First Name': 'first_name',
-        'Donor\'s Last Name': 'last_name',
-        'UTM Source': 'tag',
-        'Donation Type': 'type'
+def is_excluded_from_fuzzy(name, email_body=None):
+    """
+    Фільтр безпеки.
+    """
+    name_lower = str(name).lower()
+    stop_words = ['anonymous', 'unknown', 'donor', 'guest', 'user', 'n/a']
+    
+    # 1. Check Name
+    if any(s in name_lower for s in stop_words) or len(name_lower) < 3:
+        return True
+    
+    # 2. Check Email (if provided)
+    if email_body:
+        corporate_prefixes = ['info', 'admin', 'ceo', 'contact', 'office', 'support', 'sales', 'marketing', 'finance', 'hr', 'hello', 'team', 'account', 'billing']
+        if email_body in corporate_prefixes:
+            return True
+            
+    return False
+
+def normalize_data(df):
+    total_raw = len(df)
+    df.columns = df.columns.str.lower().str.strip()
+    
+    search_map = {
+        'date': ['date of donation', 'donation date', 'donated at', 'date', 'datetime', 'created at', 'time'],
+        
+        # FIX: Прибрав звідси 'contact of the donor'
+        'email': ['email', 'donor email', 'supporter email', 'e-mail', 'mail'],
+        
+        'amount': ['donation amount in usd', 'converted donation amount', 'amount in usd', 'converted amount', 'donation amount', 'amount', 'sum'],
+        
+        # FIX: Додав сюди 'contact of the donor' на перше місце (найвищий пріоритет)
+        'first_name': ['contact of the donor', 'donation name', 'supporter first name', 'donor\'s first name', 'first name', 'firstname', 'name'],
+        
+        'last_name': ['supporter last name', 'donor\'s last name', 'last name', 'lastname'],
+        'tag': ['designations', 'direction', 'utm campaign source', 'utm source', 'source', 'campaign']
     }
     
-    # Пріоритет вибору суми (Converted > USD > Amount)
-    if 'Converted Amount' in df.columns:
-        rename_map['Converted Amount'] = 'amount'
-    elif 'Amount in USD' in df.columns:
-        rename_map['Amount in USD'] = 'amount'
-    else:
-        rename_map['Amount'] = 'amount'
-
-    df = df.rename(columns=rename_map)
+    found_cols = {}
+    for target_col, candidates in search_map.items():
+        match = None
+        for candidate in candidates:
+            if candidate in df.columns:
+                match = candidate
+                break
+        if match: found_cols[target_col] = match
     
-    # Якщо якоїсь колонки немає - створюємо пусту
-    if 'tag' not in df.columns: df['tag'] = ''
+    rename_dict = {v: k for k, v in found_cols.items()}
+    df = df.rename(columns=rename_dict)
     
-    # Стандартизація
-    df['source_system'] = 'Donorbox'
-    df['full_name'] = (df['first_name'].fillna('') + ' ' + df['last_name'].fillna('')).str.strip()
-    
-    # Повертаємо тільки потрібні колонки
-    cols_to_keep = ['date', 'email', 'full_name', 'amount', 'tag', 'source_system']
-    # Фільтруємо ті, що реально є (щоб не падало, якщо формат трохи зміниться)
-    available_cols = [c for c in cols_to_keep if c in df.columns]
-    return df[available_cols]
+    if 'date' not in df.columns: return None, "Error: No Date column found."
+    if 'email' not in df.columns: return None, "Error: No Email column found."
 
-def normalize_funraise(df):
-    """Приводить файл Funraise (FU) до стандарту"""
-    # Мапінг колонок на основі твого файлу all-fu.csv
-    rename_map = {
-        'Donation Date': 'date',
-        'Supporter Email': 'email',
-        'Converted Donation Amount': 'amount',
-        'Supporter First Name': 'first_name',
-        'Supporter Last Name': 'last_name',
-        'UTM Campaign Source': 'tag'
-    }
-    
-    df = df.rename(columns=rename_map)
-    
-    if 'tag' not in df.columns: df['tag'] = ''
-    
-    df['source_system'] = 'Funraise'
-    df['full_name'] = (df['first_name'].fillna('') + ' ' + df['last_name'].fillna('')).str.strip()
-    
-    cols_to_keep = ['date', 'email', 'full_name', 'amount', 'tag', 'source_system']
-    available_cols = [c for c in cols_to_keep if c in df.columns]
-    return df[available_cols]
-
-def categorize_donor(row):
-    is_new = row['is_new']
-    amount = row['amount']
-    if is_new:
-        return "1. New (<500)" if amount < 500 else "2. New (500+)"
-    else:
-        return "3. Repeated (<500)" if amount < 500 else "4. Repeated (500+)"
-
-# --- UI & EXECUTION ---
-
-col_u1, col_u2 = st.columns(2)
-with col_u1:
-    file_db = st.file_uploader("📂 Завантаж All-Time DONORBOX", type=['csv'])
-with col_u2:
-    file_fu = st.file_uploader("📂 Завантаж All-Time FUNRAISE (FU)", type=['csv'])
-
-st.markdown("---")
-st.subheader("📅 Налаштування періоду звіту")
-
-col_d1, col_d2 = st.columns(2)
-with col_d1:
-    # За замовчуванням ставимо початок поточного місяця
-    default_start = datetime.today().replace(day=1)
-    start_date = st.date_input("ВІД (Дата початку аналізу)", value=default_start)
-with col_d2:
-    end_date = st.date_input("ДО (Дата кінця аналізу)", value=datetime.now())
-
-# Кнопка запуску
-if st.button("🚀 ЗМЕРДЖИТИ І ПРОАНАЛІЗУВАТИ", type="primary"):
-    if not file_db or not file_fu:
-        st.error("❌ Потрібно завантажити ОБИДВА файли з повною історією!")
-    else:
-        with st.spinner('Магія відбувається: чистимо, зшиваємо, рахуємо історію...'):
-            try:
-                # 1. Читання
-                raw_db = pd.read_csv(file_db)
-                raw_fu = pd.read_csv(file_fu)
-                
-                # 2. Нормалізація
-                df_db = normalize_donorbox(raw_db)
-                df_fu = normalize_funraise(raw_fu)
-                
-                # 3. Мердж в "Майстер-лог"
-                master_log = pd.concat([df_db, df_fu], ignore_index=True)
-                
-                # Типізація даних
-                master_log['date'] = parse_dates(master_log['date'])
-                master_log['email'] = master_log['email'].astype(str).str.lower().str.strip()
-                master_log['amount'] = pd.to_numeric(master_log['amount'], errors='coerce').fillna(0)
-                
-                # Сортування
-                master_log = master_log.sort_values('date')
-                
-                total_rows = len(master_log)
-                
-            except Exception as e:
-                st.error(f"Помилка обробки файлів: {e}")
-                st.stop()
-
-        st.success(f"✅ Успішно оброблено {total_rows} транзакцій за весь час.")
-
-        # --- ГОЛОВНА ЛОГІКА (Машина часу) ---
-        
-        # Конвертуємо дати з UI в timestamp
-        # start_date -> 00:00:00
-        start_ts = pd.Timestamp(datetime.combine(start_date, time.min))
-        # end_date -> 23:59:59
-        end_ts = pd.Timestamp(datetime.combine(end_date, time.max))
-
-        # 4. Визначаємо "Базу Supporters" (історію ДО початку періоду)
-        # Всі унікальні емейли, які донатили раніше
-        history_before = master_log[master_log['date'] < start_ts]
-        existing_donors_set = set(history_before['email'].unique())
-        
-        st.info(f"📚 На момент {start_date} у базі знайдено {len(existing_donors_set)} існуючих донорів (Supporters).")
-
-        # 5. Визначаємо "Робочий звіт" (Транзакції В ПЕРІОДІ)
-        current_batch = master_log[
-            (master_log['date'] >= start_ts) & 
-            (master_log['date'] <= end_ts)
-        ].copy()
-        
-        if current_batch.empty:
-            st.warning("⚠️ У вибраному діапазоні дат немає транзакцій.")
+    # Ensure text columns are actually strings
+    for col in ['first_name', 'last_name', 'tag']:
+        if col not in df.columns: 
+            df[col] = ''
         else:
-            # 6. Визначаємо статуси (New vs Repeated)
-            # Логіка: Якщо email немає в existing_donors_set -> New. Інакше -> Repeated.
-            current_batch['is_new'] = ~current_batch['email'].isin(existing_donors_set)
-            
-            # Категоризація по грошах
-            current_batch['category'] = current_batch.apply(categorize_donor, axis=1)
-            
-            # 7. Рахуємо частоту В МЕЖАХ ПЕРІОДУ (для KPI "2+ донатів")
-            batch_counts = current_batch['email'].value_counts().to_dict()
-            current_batch['transactions_in_period'] = current_batch['email'].map(batch_counts)
+            df[col] = df[col].astype(str).replace('nan', '').fillna('')
+    
+    # Формуємо повне ім'я (якщо contact of the donor це повне ім'я, воно піде в first_name, а last_name буде пустим - це ок)
+    df['full_name'] = (df['first_name'] + ' ' + df['last_name']).str.strip()
+    
+    df['email'] = df['email'].astype(str).str.lower().str.strip()
+    df['email_body'] = df['email'].apply(lambda x: x.split('@')[0] if '@' in x else x)
+    
+    df['date'] = pd.to_datetime(df['date'], format='mixed', errors='coerce')
+    df = df.dropna(subset=['date'])
+    
+    df['amount'] = df['amount'].apply(clean_money)
+    zeros = len(df[df['amount'] <= 0])
+    df = df[df['amount'] > 0]
+    
+    final_count = len(df)
+    stats = {"raw_rows": total_raw, "zero_amounts": zeros, "final_rows": final_count}
+    
+    return df[['date', 'email', 'email_body', 'full_name', 'amount', 'tag']], stats
 
-            # --- СТАТИСТИКА (KPI) ---
-            
-            # Групуємо по унікальних людях
-            unique_people = current_batch.groupby('email').agg({
-                'is_new': 'first',
-                'amount': 'max', # Максимальний донат визначає категорію
-                'transactions_in_period': 'first',
-                'full_name': 'first'
-            }).reset_index()
+def convert_df_to_csv(df):
+    return df.to_csv(index=False).encode('utf-8')
 
-            # Категорія для людини
-            def get_unique_cat(row):
-                if row['is_new']:
-                    return "1. New (<500)" if row['amount'] < 500 else "2. New (500+)"
-                else:
-                    return "3. Repeated (<500)" if row['amount'] < 500 else "4. Repeated (500+)"
-            
-            unique_people['unique_category'] = unique_people.apply(get_unique_cat, axis=1)
+# --- UI EXECUTION ---
 
-            # Розрахунок метрик
-            total_u = len(unique_people)
-            one_time = len(unique_people[unique_people['transactions_in_period'] == 1])
-            multi = len(unique_people[unique_people['transactions_in_period'] > 1])
-            
-            st.markdown("---")
-            st.subheader(f"📊 Результат за період: {start_date} — {end_date}")
-            
-            k1, k2, k3 = st.columns(3)
-            k1.metric("Унікальних донорів", total_u, help="Кількість унікальних людей у звіті")
-            k2.metric("1 донат за період", one_time, help="Люди, які зробили лише 1 транзакцію за цей час")
-            k3.metric("2+ донатів за період", multi, help="Люди, які зробили 2 або більше транзакцій за цей час (ваші герої)")
-            
-            # Графік
-            chart_data = unique_people['unique_category'].value_counts().sort_index()
-            st.bar_chart(chart_data)
+st.sidebar.header("1. Data Input")
+uploaded_file = st.sidebar.file_uploader("Upload Master File (Excel/CSV)", type=['xlsx', 'xls', 'csv'])
 
-            # --- ЕКСПОРТ ---
-            st.markdown("### 📥 Отримати файл")
+if uploaded_file:
+    try:
+        if uploaded_file.name.endswith('.csv'):
+            raw_df = pd.read_csv(uploaded_file)
+        else:
+            raw_df = pd.read_excel(uploaded_file)
             
-            # Формуємо красиву табличку на вихід
-            export_df = current_batch[[
-                'date', 'full_name', 'email', 'amount', 'category', 'is_new', 
-                'tag', 'source_system', 'transactions_in_period'
-            ]].sort_values('date', ascending=False)
+        df, load_stats = normalize_data(raw_df)
+        
+        if df is None:
+            st.error(load_stats)
+            st.stop()
             
-            export_df.columns = [
-                'Date', 'Name', 'Email', 'Amount', 'Category', 'Is New?', 
-                'Tag', 'Source', 'Tx Count (Period)'
-            ]
+        df = df.sort_values('date')
+        
+        st.sidebar.success(f"✅ Loaded: {len(df)} txs")
+        st.sidebar.markdown(f"**Data Quality Log:**")
+        st.sidebar.text(f"Raw Rows:   {load_stats['raw_rows']}")
+        st.sidebar.text(f"Zero/Ref:   -{load_stats['zero_amounts']}")
+        st.sidebar.text(f"Clean Rows: ={load_stats['final_rows']}")
+        
+    except Exception as e:
+        st.error(f"File Error: {e}")
+        st.stop()
+
+    st.header("2. Analysis Settings")
+    c1, c2 = st.columns(2)
+    start_date = c1.date_input("From (Inclusive)", value=datetime(2025, 12, 1))
+    end_date = c2.date_input("To (Inclusive)", value=datetime.now())
+    
+    use_smart_match = st.checkbox("🧠 Enable Smart Name Match", value=False, 
+                                  help="Якщо пошта не знайдена, шукає збіг по колонці Contact of the donor. Поріг схожості 88%.")
+
+    if st.button("🚀 Run Aggregated Analytics", type="primary"):
+        ts_start = pd.Timestamp(datetime.combine(start_date, time.min))
+        ts_end = pd.Timestamp(datetime.combine(end_date, time.max))
+        
+        # 1. SPLIT DATA
+        history_df = df[df['date'] < ts_start]
+        period_df = df[(df['date'] >= ts_start) & (df['date'] <= ts_end)].copy()
+        
+        if period_df.empty:
+            st.warning("No transactions in selected period.")
+            st.stop()
+
+        # 2. LIFETIME STATS (Aggregation by Email)
+        lifetime_stats = df.groupby('email').agg(
+            lifetime_count=('date', 'count'),
+            lifetime_sum=('amount', 'sum')
+        )
+        
+        # 3. PERIOD STATS (Aggregation by Email)
+        period_stats = period_df.groupby('email').agg(
+            period_count=('date', 'count'),
+            period_sum=('amount', 'sum'),
+            full_name=('full_name', 'first'),
+            email_body=('email_body', 'first'),
+            tag=('tag', lambda x: ', '.join(sorted(set(str(i) for i in x if i and str(i).strip() != ''))))
+        ).reset_index()
+        
+        # 4. PRIMARY CHECK: EXACT EMAIL MATCH
+        existing_emails = set(history_df['email'].unique())
+        period_stats['is_new'] = ~period_stats['email'].isin(existing_emails)
+        
+        # 5. SECONDARY CHECK: SMART NAME MATCH
+        period_stats['potential_duplicate'] = False
+        smart_match_count = 0
+        
+        if use_smart_match:
+            # Беремо ТІЛЬКИ тих, хто пройшов перевірку поштою і досі вважається "Новим"
+            candidates = period_stats[period_stats['is_new'] == True]
             
-            csv = export_df.to_csv(index=False).encode('utf-8')
-            fname = f"Report_{start_date}_{end_date}.csv"
+            # Готуємо базу історичних імен (унікальні, очищені)
+            history_names = history_df['full_name'].dropna().unique()
+            history_names = [n for n in history_names if not is_excluded_from_fuzzy(n)] # Фільтруємо сміття
             
+            if len(history_names) > 0 and not candidates.empty:
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                total_cand = len(candidates)
+                
+                for i, (idx, row) in enumerate(candidates.iterrows()):
+                    # UI Update
+                    if i % 10 == 0: 
+                        progress_bar.progress(int((i / total_cand) * 100))
+                        status_text.text(f"Smart Match Scanning: {i}/{total_cand} candidates...")
+                    
+                    name_cand = row['full_name']
+                    
+                    # Безпека: не шукаємо збіги для "Anonymous" або "info@"
+                    if is_excluded_from_fuzzy(name_cand, row['email_body']): 
+                        continue
+                    
+                    # --- THE CORE LOGIC ---
+                    best_match, score = process.extractOne(name_cand, history_names, scorer=fuzz.token_sort_ratio)
+                    
+                    if score >= 88:
+                        # Знайшли! Це не новий донор, це старий з новою поштою/помилкою
+                        period_stats.at[idx, 'is_new'] = False 
+                        period_stats.at[idx, 'potential_duplicate'] = True
+                        smart_match_count += 1
+                        
+                progress_bar.empty()
+                status_text.empty()
+
+        # 6. MERGE & CATEGORIZE
+        final_df = period_stats.merge(lifetime_stats, on='email', how='left')
+        
+        def get_cat(row):
+            status = "New" if row['is_new'] else "Repeated"
+            value = "500+" if row['period_sum'] >= 500 else "<500"
+            
+            if status == "New" and value == "<500": return "1. New (<500)"
+            if status == "New" and value == "500+": return "2. New (500+)"
+            if status == "Repeated" and value == "<500": return "3. Repeated (<500)"
+            return "4. Repeated (500+)"
+
+        final_df['Category'] = final_df.apply(get_cat, axis=1)
+        
+        # Rename Cols for Export
+        output_cols = ['email', 'full_name', 'period_count', 'period_sum', 'lifetime_count', 'lifetime_sum', 'Category', 'tag', 'potential_duplicate']
+        pretty_cols = {
+            'email': 'Email', 'full_name': 'Name', 
+            'period_count': 'Period Tx', 'period_sum': 'Period Sum ($)', 
+            'lifetime_count': 'Lifetime Tx', 'lifetime_sum': 'Lifetime Sum ($)', 
+            'tag': 'Tags', 'potential_duplicate': 'Name Match Flag'
+        }
+        
+        final_df = final_df[output_cols].rename(columns=pretty_cols)
+        
+        # --- STATISTICS DASHBOARD ---
+        st.divider()
+        st.subheader("📊 Analytical Report")
+        
+        total_raised = final_df['Period Sum ($)'].sum()
+        total_donors = len(final_df)
+        avg_val = total_raised / total_donors if total_donors > 0 else 0
+        
+        # Metrics
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Total Period Volume", f"${total_raised:,.2f}")
+        m2.metric("Unique Donors", total_donors)
+        m3.metric("Avg Donor Value", f"${avg_val:,.2f}")
+        m4.metric("Smart Match Saves", smart_match_count, help="Donors identified by Name Match (ignoring Email)")
+        
+        # Segmentation Breakdown
+        st.markdown("### 🧩 Segmentation Breakdown")
+        
+        df_new = final_df[final_df['Category'].str.contains("New")]
+        df_rep = final_df[final_df['Category'].str.contains("Repeated")]
+        
+        sc1, sc2 = st.columns(2)
+        with sc1:
+            st.info(f"**🐣 New Donors**")
+            col_a, col_b = st.columns(2)
+            col_a.metric("Count", len(df_new))
+            col_b.metric("Volume", f"${df_new['Period Sum ($)'].sum():,.2f}")
+        
+        with sc2:
+            st.success(f"**🔄 Repeated Donors**")
+            col_a, col_b = st.columns(2)
+            col_a.metric("Count", len(df_rep))
+            col_b.metric("Volume", f"${df_rep['Period Sum ($)'].sum():,.2f}")
+
+        # --- DOWNLOADS ---
+        st.divider()
+        st.markdown("### 📥 Download Lists")
+        st.caption("Число в дужках [] — це кількість унікальних донорів у файлі.")
+        
+        df_new_low = final_df[final_df['Category'] == "1. New (<500)"]
+        df_new_high = final_df[final_df['Category'] == "2. New (500+)"]
+        df_rep_low = final_df[final_df['Category'] == "3. Repeated (<500)"]
+        df_rep_high = final_df[final_df['Category'] == "4. Repeated (500+)"]
+        
+        d1, d2, d3, d4 = st.columns(4)
+        
+        with d1:
             st.download_button(
-                label="📥 Скачати CSV звіт",
-                data=csv,
-                file_name=fname,
-                mime='text/csv',
-                type='primary'
+                f"📂 1. New (<500) [{len(df_new_low)}]", 
+                convert_df_to_csv(df_new_low), 
+                f"New_Low_{start_date}.csv", "text/csv"
+            )
+        with d2:
+            st.download_button(
+                f"📂 2. New (500+) [{len(df_new_high)}]", 
+                convert_df_to_csv(df_new_high), 
+                f"New_High_{start_date}.csv", "text/csv"
+            )
+        with d3:
+            st.download_button(
+                f"📂 3. Repeated (<500) [{len(df_rep_low)}]", 
+                convert_df_to_csv(df_rep_low), 
+                f"Rep_Low_{start_date}.csv", "text/csv"
+            )
+        with d4:
+            st.download_button(
+                f"📂 4. Repeated (500+) [{len(df_rep_high)}]", 
+                convert_df_to_csv(df_rep_high), 
+                f"Rep_High_{start_date}.csv", "text/csv"
             )
             
-            with st.expander("🔍 Переглянути деталі (Preview)"):
-                st.dataframe(export_df.head(100))
+        with st.expander("🔍 Preview Data"):
+            st.dataframe(final_df.head(50))
