@@ -43,19 +43,20 @@ def normalize_data(df):
     total_raw = len(df)
     df.columns = df.columns.str.lower().str.strip()
     
+    # ОНОВЛЕНА МАПА ПОШУКУ
     search_map = {
         'date': ['date of donation', 'donation date', 'donated at', 'date', 'datetime', 'created at', 'time'],
-        
-        # FIX: Прибрав звідси 'contact of the donor'
         'email': ['email', 'donor email', 'supporter email', 'e-mail', 'mail'],
-        
         'amount': ['donation amount in usd', 'converted donation amount', 'amount in usd', 'converted amount', 'donation amount', 'amount', 'sum'],
-        
-        # FIX: Додав сюди 'contact of the donor' на перше місце (найвищий пріоритет)
         'first_name': ['contact of the donor', 'donation name', 'supporter first name', 'donor\'s first name', 'first name', 'firstname', 'name'],
-        
         'last_name': ['supporter last name', 'donor\'s last name', 'last name', 'lastname'],
-        'tag': ['designations', 'direction', 'utm campaign source', 'utm source', 'source', 'campaign']
+        
+        # --- НОВІ КОЛОНКИ ---
+        'platform': ['platform', 'payment gateway', 'provider', 'via'],
+        'source_origin': ['source'], # Прямий пошук колонки SOURCE
+        
+        # Tag тепер шукає все інше, крім source (щоб не було конфлікту)
+        'tag': ['designations', 'direction', 'utm campaign source', 'utm source', 'campaign', 'project']
     }
     
     found_cols = {}
@@ -73,16 +74,16 @@ def normalize_data(df):
     if 'date' not in df.columns: return None, "Error: No Date column found."
     if 'email' not in df.columns: return None, "Error: No Email column found."
 
-    # Ensure text columns are actually strings
-    for col in ['first_name', 'last_name', 'tag']:
+    # FIX: Ensure text columns are actually strings
+    # Додаємо сюди нові колонки, щоб перетворити їх на текст і прибрати NaN
+    text_cols = ['first_name', 'last_name', 'tag', 'platform', 'source_origin']
+    for col in text_cols:
         if col not in df.columns: 
             df[col] = ''
         else:
             df[col] = df[col].astype(str).replace('nan', '').fillna('')
     
-    # Формуємо повне ім'я (якщо contact of the donor це повне ім'я, воно піде в first_name, а last_name буде пустим - це ок)
     df['full_name'] = (df['first_name'] + ' ' + df['last_name']).str.strip()
-    
     df['email'] = df['email'].astype(str).str.lower().str.strip()
     df['email_body'] = df['email'].apply(lambda x: x.split('@')[0] if '@' in x else x)
     
@@ -96,7 +97,8 @@ def normalize_data(df):
     final_count = len(df)
     stats = {"raw_rows": total_raw, "zero_amounts": zeros, "final_rows": final_count}
     
-    return df[['date', 'email', 'email_body', 'full_name', 'amount', 'tag']], stats
+    # Повертаємо нові колонки теж
+    return df[['date', 'email', 'email_body', 'full_name', 'amount', 'tag', 'platform', 'source_origin']], stats
 
 def convert_df_to_csv(df):
     return df.to_csv(index=False).encode('utf-8')
@@ -158,12 +160,18 @@ if uploaded_file:
         )
         
         # 3. PERIOD STATS (Aggregation by Email)
+        # ТУТ ДОДАЄМО АГРЕГАЦІЮ НОВИХ КОЛОНОК
         period_stats = period_df.groupby('email').agg(
             period_count=('date', 'count'),
             period_sum=('amount', 'sum'),
             full_name=('full_name', 'first'),
             email_body=('email_body', 'first'),
-            tag=('tag', lambda x: ', '.join(sorted(set(str(i) for i in x if i and str(i).strip() != ''))))
+            
+            # Склеюємо унікальні значення через кому
+            tag=('tag', lambda x: ', '.join(sorted(set(str(i) for i in x if i and str(i).strip() != '')))),
+            platform=('platform', lambda x: ', '.join(sorted(set(str(i) for i in x if i and str(i).strip() != '')))),
+            source_origin=('source_origin', lambda x: ', '.join(sorted(set(str(i) for i in x if i and str(i).strip() != ''))))
+            
         ).reset_index()
         
         # 4. PRIMARY CHECK: EXACT EMAIL MATCH
@@ -175,12 +183,9 @@ if uploaded_file:
         smart_match_count = 0
         
         if use_smart_match:
-            # Беремо ТІЛЬКИ тих, хто пройшов перевірку поштою і досі вважається "Новим"
             candidates = period_stats[period_stats['is_new'] == True]
-            
-            # Готуємо базу історичних імен (унікальні, очищені)
             history_names = history_df['full_name'].dropna().unique()
-            history_names = [n for n in history_names if not is_excluded_from_fuzzy(n)] # Фільтруємо сміття
+            history_names = [n for n in history_names if not is_excluded_from_fuzzy(n)]
             
             if len(history_names) > 0 and not candidates.empty:
                 progress_bar = st.progress(0)
@@ -188,22 +193,17 @@ if uploaded_file:
                 total_cand = len(candidates)
                 
                 for i, (idx, row) in enumerate(candidates.iterrows()):
-                    # UI Update
                     if i % 10 == 0: 
                         progress_bar.progress(int((i / total_cand) * 100))
                         status_text.text(f"Smart Match Scanning: {i}/{total_cand} candidates...")
                     
                     name_cand = row['full_name']
-                    
-                    # Безпека: не шукаємо збіги для "Anonymous" або "info@"
                     if is_excluded_from_fuzzy(name_cand, row['email_body']): 
                         continue
                     
-                    # --- THE CORE LOGIC ---
                     best_match, score = process.extractOne(name_cand, history_names, scorer=fuzz.token_sort_ratio)
                     
                     if score >= 88:
-                        # Знайшли! Це не новий донор, це старий з новою поштою/помилкою
                         period_stats.at[idx, 'is_new'] = False 
                         period_stats.at[idx, 'potential_duplicate'] = True
                         smart_match_count += 1
@@ -225,13 +225,24 @@ if uploaded_file:
 
         final_df['Category'] = final_df.apply(get_cat, axis=1)
         
-        # Rename Cols for Export
-        output_cols = ['email', 'full_name', 'period_count', 'period_sum', 'lifetime_count', 'lifetime_sum', 'Category', 'tag', 'potential_duplicate']
+        # Rename Cols for Export (ДОДАЛИ НОВІ)
+        output_cols = [
+            'email', 'full_name', 
+            'period_count', 'period_sum', 
+            'lifetime_count', 'lifetime_sum', 
+            'Category', 
+            'platform', 'source_origin', 'tag', # <--- ОСЬ ВОНИ
+            'potential_duplicate'
+        ]
+        
         pretty_cols = {
             'email': 'Email', 'full_name': 'Name', 
             'period_count': 'Period Tx', 'period_sum': 'Period Sum ($)', 
             'lifetime_count': 'Lifetime Tx', 'lifetime_sum': 'Lifetime Sum ($)', 
-            'tag': 'Tags', 'potential_duplicate': 'Name Match Flag'
+            'tag': 'Tags (Designation)', 
+            'platform': 'Platform',          # <---
+            'source_origin': 'Source',       # <---
+            'potential_duplicate': 'Name Match Flag'
         }
         
         final_df = final_df[output_cols].rename(columns=pretty_cols)
@@ -244,14 +255,12 @@ if uploaded_file:
         total_donors = len(final_df)
         avg_val = total_raised / total_donors if total_donors > 0 else 0
         
-        # Metrics
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Total Period Volume", f"${total_raised:,.2f}")
         m2.metric("Unique Donors", total_donors)
         m3.metric("Avg Donor Value", f"${avg_val:,.2f}")
-        m4.metric("Smart Match Saves", smart_match_count, help="Donors identified by Name Match (ignoring Email)")
+        m4.metric("Smart Match Saves", smart_match_count, help="Donors identified by Name Match")
         
-        # Segmentation Breakdown
         st.markdown("### 🧩 Segmentation Breakdown")
         
         df_new = final_df[final_df['Category'].str.contains("New")]
